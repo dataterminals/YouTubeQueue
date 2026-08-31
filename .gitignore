@@ -1,0 +1,16 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+
+# logs / scratch
+*.log
+scratch/
+tmp/
+
+# node (only if a build step is added later)
+node_modules/

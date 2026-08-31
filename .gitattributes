@@ -1,0 +1,2 @@
+# Normalize line endings to LF in the repo (userscripts are plain text).
+* text=auto eol=lf
