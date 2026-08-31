@@ -90,10 +90,40 @@ reordering is *never* gated for a queue. YouTube simply hides the handle (`#reor
 which is why the script forces it visible. The capability was always there; only the affordance was
 missing.
 
-**Known limit:** this needs `ytd-playlist-panel-renderer#playlist` in the DOM. It is present on
-`/watch` and *survives SPA navigation away from it* (confirmed: still present and functional on the
-home page after visiting a video). But on a **cold load** of a browse page it is absent, so reorder
-and remove degrade to unavailable there and say so. Adding is unaffected.
+**When the panel isn't there — strategy 2 (v0.2.0).** `handleDrop` needs
+`ytd-playlist-panel-renderer#playlist` in the DOM. That is present on `/watch`, survives SPA
+navigation away from it, and is even re-created on a *full* load of a browse page **when a queue is
+actively playing**. The gap is narrower than it first looked but very real: queue some videos from a
+search page without opening any of them and there is no panel, no player — and in v0.1.0 every drag
+in that state did nothing but raise a toast. That was the bug reported after the first install.
+
+So there is a second path, used whenever strategy 1 is unavailable:
+
+```js
+{ commandMetadata: { webCommandMetadata: { sendPost: true,
+                     apiUrl: '/youtubei/v1/browse/edit_playlist' } },
+  playlistEditEndpoint: { playlistId: 'TLPQ…', params: 'CAE%3D',
+    actions: [{ action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: '<moving>',
+                movedSetVideoIdPredecessor: '<the one it lands after>' }] } }
+```
+
+- **Omitting `movedSetVideoIdPredecessor` moves the item to the front** — verified, which is why this
+  one action expresses every move and there is no need for `ACTION_MOVE_VIDEO_BEFORE` (which also
+  works, with `movedSetVideoIdSuccessor`, but is redundant).
+- **It persists.** Verified by reloading and reading the fresh server order: it matched, and the
+  player agreed.
+- **Nothing updates the local copy.** Unlike the harvested remove endpoint, a hand-built move carries
+  no `clientActions`, and `getPlaylistData()` stayed stale for the full 15 s it was watched. So the
+  move is followed by `yt-playlist-manager.setPlaylistData()` with the list reordered to match what
+  we just asked the server for. End-to-end check: two moves (mid-list, and drag-to-front) applied
+  instantly in the dock, and a fresh server read afterwards matched the optimistic order exactly.
+- **Guard:** `setPlaylistData` updates the manager, never the player. If a player is currently driving
+  this queue, strategy 2 refuses rather than let display and playback disagree. A player owning the
+  queue implies a watch page rendered, which implies the panel exists — so in practice strategy 1
+  covers that state and this is a backstop.
+
+The index arithmetic: to land at final index `to`, the item must follow `without[to - 1]`, where
+`without` is the list minus the item being moved. `to === 0` means no predecessor.
 
 ### 4. REMOVE — verified signed-in ✅
 
@@ -151,17 +181,35 @@ returns `'partial'` so the UI can say precisely that. Verified: 3-item queue →
 The removes are staggered ~350 ms apart because each is a server round trip. That is safe because
 `setVideoId`s are stable per-item identifiers, not positions, so they stay valid as the list shrinks.
 
-### Signed-in queues already survive a reload
+### Signed-in queues sometimes survive a reload — it depends on the session
 
-Signed **out**, a hard reload empties the queue (verified). Signed **in**, it does not — a full page
-load restored the queue with the *same* `TLPQ` id, i.e. YouTube persists it server-side against the
-session.
+Signed **out**, a hard reload always empties the queue (verified).
 
-This narrows what the snapshot/restore feature is actually for. It is **not** the primary mechanism
-for a signed-in user; it is a safety net for when YouTube does drop the queue — a clear, a signed-out
-session, a long enough gap. That is worth stating plainly in the README rather than overselling it,
-and it is a further argument for keeping auto-restore off by default: for the common case YouTube has
-already done the job, and replaying a snapshot over a queue YouTube just restored would duplicate it.
+Signed **in** it is conditional, and the first pass over-read the evidence. A queue tied to an
+**active watch session** does come back across a full page load — same `TLPQ` id, server-side. But a
+queue built on a browse page with **nothing playing** was gone after a reload in a later test. The
+honest statement is "often, not always", and the README says that rather than promising persistence.
+
+Either way the conclusion for this script is the same, and it is the one that matters: **auto-restore
+must not assume the queue is missing just because it is missing at boot.** YouTube's own restore can
+land after we start, so replaying a snapshot on a timer would append the whole list a second time on
+top of the one YouTube brought back. `maybeAutoRestore` therefore waits up to 6 s for a queue to
+appear and only replays if none does. This is also why auto-restore stays off by default.
+
+### Thumbnails steal the drag
+
+A `<img>` is draggable by default (`-webkit-user-drag: auto`, `img.draggable === true`). The dock's
+rows carry a 60×34 thumbnail, so a large share of each row's grab area started an **image drag**
+instead of the row drag, and the row never moved. Together with the missing-panel gap above, this is
+what "dragging isn't working very well" turned out to be — and unlike the panel gap, it applied on
+*every* page, every time.
+
+Fixed with both belts: `img.draggable = false` at construction and `-webkit-user-drag: none` in the
+stylesheet. Any future non-text content dropped into a draggable row needs the same treatment.
+
+The drop indicator also lied: it always drew the insertion line on the row's **top** edge, even when
+dragging downward, where the item lands *below* the target. It now picks the edge from the drag
+direction.
 
 ## Two things live testing taught us
 
@@ -221,6 +269,7 @@ trade.
 | Drag reorder | Both panels |
 | Always-visible native reorder handles | Pure CSS over a capability YouTube already had |
 | Keep native panel expanded | |
+| Hide YouTube's own queue panel (v0.2.0) | `display:none`, **never** removal — the panel staying in the DOM is what keeps the fast `handleDrop` reorder available. Verified: reorder still works, and the player stays in sync, while hidden |
 | Snapshot + restore after reload | One command; verified in exact order |
 | Diagnostics | Reports which of the four primitives are live |
 
@@ -275,7 +324,26 @@ Queue was empty before and after; nothing of the user's was disturbed.
 | `#movie_player.clearQueue()` | ❌ **no-op** — present, callable, changes nothing |
 | Native clear selector | ✅ `button[aria-label="Clear queue"]` (other two selectors match nothing) |
 | `handleDrop` present signed-in | ✅ |
-| Queue across a full page load, signed in | ⚠️ **persists** (same `TLPQ` id) — see above |
+| Queue across a full page load, signed in | ⚠️ persists when tied to an active watch session; **not** always — see above |
+
+### v0.2.0 pass — 2026-08-30 (real account, after the first install)
+
+Prompted by "dragging-to-reorder isn't working very well". Queue empty before and after.
+
+| Check | Result |
+| --- | --- |
+| Dock thumbnails draggable by default | ❌ **confirmed the bug** — `img.draggable === true`, `-webkit-user-drag: auto` |
+| Panel absent after queueing from a search page | ❌ **confirmed the bug** — `panelInDom: false`, so every v0.1.0 drag no-op'd |
+| Panel present on a browse page *while the queue plays* | ✅ so the gap is "queued but never opened a video" |
+| `ACTION_MOVE_VIDEO_AFTER` sends a request | ✅ (instrumented `fetch`; a control remove proved the instrumentation) |
+| …and persists | ✅ fresh server read after reload matched; player agreed |
+| …with no predecessor → moves to front | ✅ |
+| `ACTION_MOVE_VIDEO_BEFORE` + successor | ✅ works too, but redundant |
+| Client model refreshes itself after a move | ❌ **no** — stale for the full 15 s watched |
+| `setPlaylistData` re-syncs the client model | ✅ |
+| Strategy 2 end-to-end, no panel + no player | ✅ 2 moves applied instantly; fresh server read matched exactly |
+| Reorder still works with the panel `display:none` | ✅ order correct, player in sync |
+| Clear button present on `/feed/subscriptions` | ❌ panel in DOM but header not rendered — the `'partial'` fallback is what covers this |
 
 A note on session health: partway through testing, the signed-out session started returning `400`
 from the queue APIs and *every* add failed, including ones that had worked minutes earlier. That was
@@ -286,13 +354,15 @@ Worth remembering before chasing a phantom bug.
 
 ## Roadmap
 
-- **v0.2 — reorder without the native panel.** Reorder is now the *only* primitive that still needs
-  `ytd-playlist-panel-renderer` in the DOM (remove was freed from it in the signed-in pass). Worth
-  investigating whether YouTube's queue proxy is reachable another way — it is module-scoped and
-  `_.cx()` is not exposed as a global — which would make the dock fully independent of `/watch`.
-- **v0.2 — decide the rebuild fallback's fate.** Now that the native remove endpoint is confirmed on
-  every non-current row, the rebuild path may be dead weight. Keep it one release, see if the
-  `'playing'` and `'error'` branches ever fire in practice, then consider dropping it.
+- ~~**reorder without the native panel**~~ — done in v0.2.0 via `ACTION_MOVE_VIDEO_AFTER` +
+  `setPlaylistData`. No primitive depends on `/watch` any more except as a preferred fast path.
+- **v0.3 — decide the rebuild fallback's fate.** Now that the native remove endpoint is confirmed on
+  every non-current row, the rebuild path may be dead weight. Keep it one more release, see whether
+  the `'playing'` and `'error'` branches ever fire in practice, then consider dropping it.
+- **v0.3 — reconsider the strategy-2 player guard.** It currently refuses whenever a player owns the
+  queue, on the grounds that `setPlaylistData` cannot reach the player. If a player-side update turns
+  out to be reachable (`updatePlaylist` is present on `#movie_player` but its signature is unknown),
+  the guard could be lifted and strategy 2 would cover every state.
 - **Save the queue as a playlist — there's a native button for it.** The queue panel's header
   carries a **Save** control alongside *Clear queue*. Almost certainly "save this queue as a real
   playlist"; harvesting that endpoint the same way we harvest remove is likely a small job.

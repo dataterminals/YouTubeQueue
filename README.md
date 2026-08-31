@@ -68,22 +68,27 @@ script when a new `@version` is pushed.
 
 Everything is toggleable from the Tampermonkey tray menu → **YouTube Queue**: the thumbnail buttons,
 the play-next button, which modifier queues on click, the `Q` hotkey, the floating panel and its
-side, keeping the native panel expanded, always-visible reorder handles, whether queueing pops the
-miniplayer, and auto-restore. Settings persist via `GM_setValue` (or `localStorage` as a fallback) —
-UI preferences and a list of video IDs only, nothing sensitive.
+side, **hiding YouTube's own queue panel**, keeping that panel expanded, always-visible reorder
+handles, whether queueing pops the miniplayer, and auto-restore. Settings persist via `GM_setValue`
+(or `localStorage` as a fallback) — UI preferences and a list of video IDs only, nothing sensitive.
+
+**Hiding the native panel** (*🙈 Hide YouTube's own queue panel*) is for when the floating panel has
+made the sidebar one redundant. It hides it rather than removing it, deliberately: the panel staying
+on the page is what keeps the fast reorder path available, so everything keeps working — you just
+stop seeing a second copy of your queue.
 
 ## Two things worth knowing
 
 - **Auto-restore is off by default,** and deliberately. Restoring fires a real request to build the
   queue; doing that silently on every single page load is obnoxious. By default you get a *Restore*
   button when there's something to restore. Turn on auto-restore in the menu if you'd rather.
-  Worth knowing: **while you're signed in, YouTube already restores your queue across a page reload**
-  by itself (verified). The snapshot is a safety net for when it doesn't — a cleared queue, a signed-
-  out session, a long gap — rather than the primary mechanism.
-- **Reordering needs YouTube's queue panel to have loaded.** That panel lives on `/watch` and sticks
-  around as you navigate away from it, so on a *cold* load of the home page reordering is unavailable
-  until you've opened a video once; the script says so rather than failing quietly. **Adding and
-  removing work everywhere, always.**
+  Worth knowing: while you're signed in, YouTube often restores the queue across a page reload by
+  itself — reliably when something's playing, not always otherwise. The snapshot is a safety net for
+  when it doesn't, rather than the primary mechanism.
+- **Adding, removing and reordering all work on every page** as of v0.2.0. Where YouTube's own queue
+  panel has loaded, reordering goes through its internal handler (instant, no network); everywhere
+  else it edits the queue's playlist directly and updates the view immediately. Both were verified
+  against a live account.
 - **The video that's currently playing can't be removed from the queue.** That's YouTube's own rule —
   it's the one row it gives no remove action to. Skip past it first. The script tells you this instead
   of pretending to fail.
@@ -96,7 +101,7 @@ The script doesn't maintain its own list or scrape anything — it drives YouTub
 | --- | --- |
 | Add to queue | `ytd-app.resolveCommand()` with an `addToPlaylistCommand`, rebuilt from a bare video ID. Takes an *array*, so a whole queue is restored in one request. |
 | Read the queue | `yt-playlist-manager.getPlaylistData()` — answers on every page type, which is what lets the floating panel exist off `/watch`. |
-| Reorder / play next | Move the row's DOM node, then call the panel's own `handleDrop()`, which syncs YouTube's internal queue proxy. No network, no auth. |
+| Reorder / play next | Where the queue panel exists: move the row's DOM node and call its own `handleDrop()`, which syncs YouTube's internal queue proxy — no network, no auth. Otherwise: `ACTION_MOVE_VIDEO_AFTER` on the queue's playlist, then re-sync the local copy so the view updates at once. |
 | Remove | The row's own remove endpoint, harvested at runtime from the queue data and matched by *icon type* — YouTube labels it "Remove from playlist", and that wording is translated. |
 
 A YouTube queue is really a throwaway server-side playlist whose ID starts with `TLPQ`. The script

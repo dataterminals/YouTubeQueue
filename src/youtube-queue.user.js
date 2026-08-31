@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Queue
 // @namespace    https://github.com/dataterminals/YouTubeQueue
-// @version      0.1.0
+// @version      0.2.0
 // @description  Queue any video from any view — hover button, Shift-click, or the Q key — plus a queue panel that works on every page: running totals, one-click remove, drag reorder, and restore-after-reload.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/YouTubeQueue
@@ -56,9 +56,12 @@
 //      handleDrop. No endpoint, no auth, no network — and the player's own `getPlaylist()` reflects
 //      the new order immediately. `computeCanReorder` returns true unconditionally for any `TLPQ`
 //      playlist, so this is never gated. PLAY-NEXT is built on top: append, then move to index+1.
-//      Caveat: this needs `ytd-playlist-panel-renderer#playlist` in the DOM. It is there on /watch
-//      and it survives SPA navigation away from /watch — but on a COLD load of a browse page it is
-//      absent, so reorder degrades to unavailable there and says so (see `moveItem`).
+//      This needs `ytd-playlist-panel-renderer#playlist` in the DOM, so it is the FAST PATH, not the
+//      only one. v0.1.0 had no other, which made every drag a no-op after queueing from a search
+//      page (no panel, no player) — the bug reported on first install. v0.2.0 adds a second path:
+//      `ACTION_MOVE_VIDEO_AFTER` on the queue's own playlist (persists; omit the predecessor to move
+//      to the front) followed by `setPlaylistData` to re-sync the local copy, since a hand-built move
+//      carries no `clientActions` and nothing refreshes it otherwise. See `moveViaServer`.
 //
 //   4. REMOVE  (verified signed-in, 2026-08-30).  Each queue row carries a menu whose remove item
 //      has `icon.iconType === 'DELETE'` (its LABEL is "Remove from playlist", which is why we match
@@ -140,6 +143,7 @@
     panelKeepOpen: true,    // re-expand the native panel if YouTube collapses it
     panelHandles: true,     // keep the native drag handles permanently visible
     panelMaxHeight: 480,    // px, native panel scroll area
+    hideNativePanel: false, // hide YouTube's own queue panel and rely on the dock instead
     openMiniplayer: false,  // let a queue-add pop YouTube's miniplayer
     autoRestore: false,     // replay the saved queue automatically on a cold load
   };
@@ -409,34 +413,94 @@
   }
 
   /**
-   * Move a queue row. Implemented as "put the DOM node where it belongs, then let YouTube's own
-   * drop handler sync its internal queue proxy" — see DESIGN NOTES #3. Returns a status string so
-   * callers can explain themselves rather than failing silently.
+   * Move a queue row. Two strategies, preferred order:
+   *
+   *  1. NATIVE PANEL — move the row node, then call the panel's own `handleDrop` (DESIGN NOTES #3).
+   *     Atomic across panel, manager and player, and needs no network. Requires
+   *     `ytd-playlist-panel-renderer` in the DOM, which rules it out on a cold browse page.
+   *
+   *  2. SERVER EDIT — see `moveViaServer`. Works anywhere.
+   *
+   * Returns 'ok' | 'noop' | 'no-panel' | 'error' so callers can explain themselves.
    */
   function moveItem(from, to) {
+    const items = YT.items();
+    if (from === to || !items[from]) return 'noop';
+    to = Math.max(0, Math.min(to, items.length - 1));
+
     const panel = YT.panel();
     const ctrl = panel && panel.polymerController;
-    if (!ctrl || typeof ctrl.handleDrop !== 'function') return 'no-panel';
-
     const rows = YT.panelRows();
-    if (!rows[from] || from === to) return 'noop';
-    to = Math.max(0, Math.min(to, rows.length - 1));
 
-    const node = rows[from];
-    const parent = node.parentNode;
-    if (!parent) return 'no-panel';
-
-    // Target position is computed against the siblings AFTER `node` is taken out of the running.
-    const others = rows.filter((_, i) => i !== from);
-    const ref = others[to] || null;
-    try {
-      parent.insertBefore(node, ref);
-      ctrl.handleDrop({ currDragItem: node });
-      return 'ok';
-    } catch (e) {
-      warn('moveItem failed', e);
-      return 'error';
+    // Only drive the panel when its rows actually line up with the queue we are showing; a
+    // half-rendered or virtualised panel would otherwise move the wrong row.
+    if (ctrl && typeof ctrl.handleDrop === 'function' && rows.length === items.length && rows[from]) {
+      const node = rows[from];
+      const parent = node.parentNode;
+      if (parent) {
+        // Target position is computed against the siblings AFTER `node` leaves the running.
+        const others = rows.filter((_, i) => i !== from);
+        try {
+          parent.insertBefore(node, others[to] || null);
+          ctrl.handleDrop({ currDragItem: node });
+          return 'ok';
+        } catch (e) {
+          warn('handleDrop move failed, falling back to the server edit', e);
+        }
+      }
     }
+    return moveViaServer(from, to);
+  }
+
+  /**
+   * Reorder without the native panel, by editing the queue's playlist server-side.
+   *
+   * `ACTION_MOVE_VIDEO_AFTER` on the `TLPQ` playlist persists (verified: after a reload the fresh
+   * server order matches, and the player agrees). Omitting `movedSetVideoIdPredecessor` moves the
+   * item to the FRONT — also verified, which is why one action covers every move.
+   *
+   * The catch: unlike the harvested remove endpoint, a hand-built move carries no `clientActions`,
+   * so nothing updates YouTube's local copy — `getPlaylistData()` stays stale indefinitely (watched
+   * for 15s, never refreshed). So we re-sync the client model ourselves with `setPlaylistData`.
+   */
+  function moveViaServer(from, to) {
+    const d = YT.playlistData();
+    const contents = d && Array.isArray(d.contents) ? d.contents : null;
+    if (!contents || !contents[from]) return 'error';
+
+    // `setPlaylistData` updates the manager, never the player. So if a player is currently driving
+    // THIS queue, going around the panel would leave the two disagreeing about what plays next.
+    // Refuse rather than desync — the panel path (strategy 1) is the only safe route in that state,
+    // and if we are here it already declined. In practice a player owning the queue implies a watch
+    // page rendered, which implies the panel exists, so this is a backstop rather than a common path.
+    if (safe(() => YT.player()?.getPlaylistId?.() === d.playlistId, false)) return 'no-panel';
+
+    const movingSetId = contents[from].playlistPanelVideoRenderer?.playlistSetVideoId;
+    if (!movingSetId) return 'error';
+
+    const without = contents.filter((_, i) => i !== from);
+    const predecessor = to > 0 ? without[to - 1]?.playlistPanelVideoRenderer?.playlistSetVideoId : null;
+
+    const action = { action: 'ACTION_MOVE_VIDEO_AFTER', setVideoId: movingSetId };
+    if (predecessor) action.movedSetVideoIdPredecessor = predecessor;
+
+    const sent = YT.resolve({
+      clickTrackingParams: '',
+      commandMetadata: { webCommandMetadata: { sendPost: true, apiUrl: '/youtubei/v1/browse/edit_playlist' } },
+      playlistEditEndpoint: { playlistId: d.playlistId, params: 'CAE%3D', actions: [action] },
+    });
+    if (!sent) return 'error';
+
+    const mgr = YT.manager();
+    if (mgr && typeof mgr.setPlaylistData === 'function') {
+      const next = safe(() => JSON.parse(JSON.stringify(d)), null);
+      if (next) {
+        const moved = next.contents.splice(from, 1)[0];
+        next.contents.splice(to, 0, moved);
+        safe(() => mgr.setPlaylistData(next));
+      }
+    }
+    return 'ok';
   }
 
   /** Append, then slot the new arrival directly after whatever is playing. */
@@ -839,8 +903,8 @@
   /** Drag-to-reorder inside the dock. Explains itself when the native panel isn't loaded. */
   function wireDockDrag(dock) {
     let dragFrom = -1;
-    const clearMarks = () => dock.querySelectorAll('.ytq-over, .ytq-dragging')
-      .forEach((n) => n.classList.remove('ytq-over', 'ytq-dragging'));
+    const clearMarks = () => dock.querySelectorAll('.ytq-over, .ytq-over-below, .ytq-dragging')
+      .forEach((n) => n.classList.remove('ytq-over', 'ytq-over-below', 'ytq-dragging'));
 
     dock.addEventListener('dragstart', (e) => {
       const row = e.target.closest && e.target.closest('.ytq-row');
@@ -854,8 +918,11 @@
       const row = e.target.closest && e.target.closest('.ytq-row');
       if (!row || dragFrom < 0) return;
       e.preventDefault();
-      dock.querySelectorAll('.ytq-over').forEach((n) => n.classList.remove('ytq-over'));
-      row.classList.add('ytq-over');
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      clearMarks();
+      // Show the insertion line on the side the row will actually land on: dragging down puts it
+      // below the target, dragging up puts it above.
+      row.classList.add(Number(row.dataset.index) > dragFrom ? 'ytq-over-below' : 'ytq-over');
     });
     dock.addEventListener('drop', (e) => {
       const row = e.target.closest && e.target.closest('.ytq-row');
@@ -864,8 +931,14 @@
       e.preventDefault();
       const status = moveItem(dragFrom, Number(row.dataset.index));
       dragFrom = -1;
-      if (status === 'no-panel') toast('Reordering needs YouTube’s queue panel — open a video once, then try again');
-      setTimeout(() => renderDock(true), 250);
+      if (status === 'no-panel') {
+        toast('Can’t reorder from here while this queue is playing — open the video, or use YouTube’s own panel');
+      } else if (status === 'error') {
+        toast('Couldn’t move that one');
+      }
+      // Redraw immediately for the optimistic case, then again once YouTube has settled.
+      renderDock(true);
+      setTimeout(() => renderDock(true), 700);
     });
     dock.addEventListener('dragend', () => { clearMarks(); dragFrom = -1; });
   }
@@ -966,6 +1039,10 @@
         img.src = it.thumb;
         img.alt = '';
         img.loading = 'lazy';
+        // Images are natively draggable, so grabbing a row by its thumbnail starts an IMAGE drag
+        // and the row never moves. The thumbnail is a big share of the row, which made reordering
+        // feel broken. Belt and braces: the attribute here, `-webkit-user-drag` in the CSS.
+        img.draggable = false;
         li.appendChild(img);
       } else {
         li.appendChild(el('span', 'ytq-thumb'));
@@ -1010,7 +1087,7 @@
     }
 
     const existing = panel.querySelector('.ytq-panel-totals');
-    if (!prefs.panelTotals) { if (existing) existing.remove(); return; }
+    if (!prefs.panelTotals || prefs.hideNativePanel) { if (existing) existing.remove(); return; }
 
     const items = YT.items();
     if (!items.length) { if (existing) existing.remove(); return; }
@@ -1165,11 +1242,16 @@
   .ytq-row.ytq-past .ytq-thumb, .ytq-row.ytq-past .ytq-meta { opacity: .5; }
   .ytq-row.ytq-dragging { opacity: .4; }
   .ytq-row.ytq-over { box-shadow: inset 0 2px 0 var(--yt-spec-text-primary, #f1f1f1); }
+  .ytq-row.ytq-over-below { box-shadow: inset 0 -2px 0 var(--yt-spec-text-primary, #f1f1f1); }
 
   .ytq-drag { width: 12px; text-align: center; color: var(--yt-spec-text-secondary, #aaa); opacity: 0; font-size: 12px; }
   .ytq-row:hover .ytq-drag { opacity: .8; }
   .ytq-num { width: 16px; text-align: right; font-size: 11px; color: var(--yt-spec-text-secondary, #aaa); flex: 0 0 auto; }
-  .ytq-thumb { width: 60px; height: 34px; object-fit: cover; border-radius: 4px; background: #000; flex: 0 0 auto; }
+  .ytq-thumb {
+    width: 60px; height: 34px; object-fit: cover; border-radius: 4px; background: #000; flex: 0 0 auto;
+    /* Without this the thumbnail starts its own image-drag and the row never moves. */
+    -webkit-user-drag: none; user-drag: none; user-select: none;
+  }
   .ytq-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; cursor: pointer; }
   .ytq-t {
     font-size: 12.5px; line-height: 1.25; max-height: 2.5em; overflow: hidden;
@@ -1219,8 +1301,14 @@
       node.id = 'ytq-style';
       (document.head || document.documentElement).appendChild(node);
     }
+    // Hiding is `display:none` on purpose, never removal: the panel staying in the DOM is what
+    // keeps the fast `handleDrop` reorder path available. Hidden, reordering still works exactly
+    // as before — it just happens out of sight.
+    const hide = prefs.hideNativePanel
+      ? '\n  ytd-playlist-panel-renderer#playlist { display: none !important; }'
+      : '';
     node.textContent = CSS + (prefs.panelHandles ? CSS_HANDLES : '') + `
-  ytd-playlist-panel-renderer#playlist #items { max-height: ${prefs.panelMaxHeight}px !important; }`;
+  ytd-playlist-panel-renderer#playlist #items { max-height: ${prefs.panelMaxHeight}px !important; }` + hide;
   }
 
   // ===========================================================================
@@ -1276,6 +1364,10 @@
       setPref('dockSide', prefs.dockSide === 'right' ? 'left' : 'right');
       renderDock(true);
     });
+    add(`🙈 Hide YouTube's own queue panel: ${onOff(prefs.hideNativePanel)}`, () => {
+      setPref('hideNativePanel', !prefs.hideNativePanel);
+      injectStyles();
+    });
     add(`📐 Keep native panel expanded: ${onOff(prefs.panelKeepOpen)}`, () => setPref('panelKeepOpen', !prefs.panelKeepOpen));
     add(`⠿ Always show reorder handles: ${onOff(prefs.panelHandles)}`, () => { setPref('panelHandles', !prefs.panelHandles); injectStyles(); });
     add(`📺 Queueing opens the miniplayer: ${onOff(prefs.openMiniplayer)}`, () => setPref('openMiniplayer', !prefs.openMiniplayer));
@@ -1301,7 +1393,7 @@
     const probe = items.findIndex((it, i) => i !== current && !it.selected);
 
     const report = {
-      version: '0.1.0',
+      version: '0.2.0',
       page: location.pathname,
       'add: ytd-app.resolveCommand': !!(YT.app() && typeof YT.app().resolveCommand === 'function'),
       'read: yt-playlist-manager': !!YT.manager(),
