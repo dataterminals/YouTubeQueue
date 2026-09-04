@@ -28,11 +28,19 @@ sidebar, playlist pages:
 ### A queue panel that works everywhere
 
 - **Floating panel on every page** (not just `/watch`), so you can see and manage the queue while you
-  keep browsing. Toggle it with **`Alt+Shift+Q`**, collapse it to a small pill, drag its top edge to
-  resize, and put it on whichever side you like.
+  keep browsing.
+- **A real window.** Drag it anywhere by its title bar, resize it from any edge or corner, and it
+  remembers where you left it. Three sizes of "out of the way": full panel, **rolled up** to just
+  its title bar, or **minimized** to a small pill you can also park wherever you like. Double-click
+  the title bar to put it back in its corner at the default size.
+- **Optional fade.** Turn on *Fade the panel while you watch* and it drops to 30% opacity until you
+  point at it — visible enough to glance at, faint enough to sit over a video.
 - **Running totals.** How many are queued, the total runtime, and how much is left after the current
   video — in both the floating panel and YouTube's own sidebar panel.
 - **One-click remove** on every row, and **drag to reorder**.
+- **Nothing is greyed out.** Rows above the one that's playing are drawn exactly like the rest,
+  because a queue isn't necessarily played front to back — "earlier in the list" doesn't mean
+  "already watched". Only the row that's actually playing is marked.
 - **Reorder handles that are actually visible.** YouTube's queue has always been drag-reorderable;
   it just hides the handle until you happen to hover the exact right pixel. This keeps it on.
 - **Keeps the native panel expanded** instead of letting it collapse on you.
@@ -61,15 +69,21 @@ script when a new `@version` is pushed.
 | Queue the hovered video | **`Q`** |
 | Play the hovered video next | **`Shift+Q`** |
 | Queue any video link | **Shift-click** it |
-| Show/hide the floating panel | **`Alt+Shift+Q`** |
+| Minimize / restore the floating panel | **`Alt+Shift+Q`** |
 | Queue / play next from a thumbnail | Hover it, click the button that appears (top-left) |
-| Resize the panel | Drag its top edge |
+| Move the panel | Drag its title bar (the pill drags too, and keeps its own spot) |
+| Resize the panel | Drag any edge or corner — the grip is at the bottom right |
+| Roll it up to the title bar | The **`▾`** button |
+| Minimize it to a pill | The **`–`** button |
+| Put it back in its corner | Double-click the title bar |
 | Reorder | Drag a row, in either the floating panel or YouTube's own |
 
 Everything is toggleable from the Tampermonkey tray menu → **YouTube Queue**: the thumbnail buttons,
-the play-next button, which modifier queues on click, the `Q` hotkey, the floating panel and its
-side, **hiding YouTube's own queue panel**, keeping that panel expanded, always-visible reorder
-handles, whether queueing pops the miniplayer, and auto-restore. Settings persist via `GM_setValue`
+the play-next button, which modifier queues on click, the `Q` hotkey, the floating panel, which
+corner it parks in, the idle fade, **hiding YouTube's own queue panel**, keeping that panel
+expanded, always-visible reorder handles, whether queueing pops the miniplayer, and auto-restore.
+There is also a **📍 Reset panel position and size** command for when you've dragged it somewhere
+you regret. Settings persist via `GM_setValue`
 (or `localStorage` as a fallback) — UI preferences and a list of video IDs only, nothing sensitive.
 
 **Hiding the native panel** (*🙈 Hide YouTube's own queue panel*) is for when the floating panel has
@@ -116,6 +130,10 @@ on the current page. That's the fastest way to tell "YouTube changed something" 
 - All four paths — add, read, reorder, remove — plus restore were verified against live YouTube on
   **2026-08-30**, signed out *and* signed in. If something misbehaves, run Diagnostics and
   [open an issue](https://github.com/dataterminals/YouTubeQueue/issues) with the output.
+- The v0.3.0 window changes (move, resize, roll up, minimize) touch none of those four paths. They
+  were verified on **2026-09-04** against a local harness that stubs YouTube's queue manager — move
+  and all eight resize directions, the state machine, off-screen clamping, and the v0.2 → v0.3
+  settings migration. Not yet given a pass on live YouTube.
 - YouTube is mid-migration from `ytd-*-renderer` elements to `yt-lockup-view-model`. Rather than
   chase that with a selector list, thumbnails are found structurally (a link that resolves to a video
   ID *and* contains an image), which covers both generations and whatever comes next.

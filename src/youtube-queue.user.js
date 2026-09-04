@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Queue
 // @namespace    https://github.com/dataterminals/YouTubeQueue
-// @version      0.2.0
-// @description  Queue any video from any view — hover button, Shift-click, or the Q key — plus a queue panel that works on every page: running totals, one-click remove, drag reorder, and restore-after-reload.
+// @version      0.3.0
+// @description  Queue any video from any view — hover button, Shift-click, or the Q key — plus a movable, resizable queue panel that works on every page: running totals, one-click remove, drag reorder, and restore-after-reload.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/YouTubeQueue
 // @supportURL   https://github.com/dataterminals/YouTubeQueue/issues
@@ -112,6 +112,9 @@
 //     the queue is empty, the dock says the queue is empty.
 //   * We only touch throwaway `TLPQ` queues. If the user is playing a real playlist, we keep our
 //     hands off it — no Clear, no reorder, no remove.
+//   * The dock is a WINDOW: movable, resizable, and it remembers where it was left. Its move and
+//     resize gestures use POINTER events, while the rows use HTML5 drag-and-drop to reorder. Do not
+//     mix the two on one surface -- they fight over the same gesture. See the geometry section.
 //   * Only non-sensitive UI prefs and a list of videoIds are persisted (`ytq_prefs_v1`,
 //     `ytq_snapshot_v1`). No credentials, no tokens, no account data.
 //   * Restore is opt-in per use: a snapshot never replays itself unless auto-restore is on, because
@@ -121,6 +124,8 @@
 
 (function () {
   'use strict';
+
+  const VERSION = '0.3.0';
 
   // ===========================================================================
   // Preferences. GM storage when available, localStorage otherwise. UI only.
@@ -136,9 +141,15 @@
     clickModifier: 'shift', // 'shift' | 'alt' | 'middle' | 'off'
     hotkeys: true,          // Q / Shift+Q on the hovered video
     dock: true,             // floating queue panel on every page
-    dockOpen: true,         // dock starts expanded rather than as a pill
-    dockSide: 'right',      // 'right' | 'left' — left overlaps the guide rail on browse pages
-    dockHeight: 330,        // px, drag-resizable
+    dockState: 'open',      // 'open' | 'shaded' (title bar only) | 'pill'
+    dockSide: 'right',      // corner the panel parks in until you drag it somewhere else
+    dockX: null,            // px from the viewport's left edge; null = still parked in the corner
+    dockY: null,            // px from the top edge; null = ditto
+    dockW: 340,             // px, drag-resizable from any edge or corner
+    dockH: 330,             // px — the LIST's height, not the whole panel's (see applyGeometry)
+    pillX: null,            // the pill remembers its own spot, independently of the panel
+    pillY: null,
+    dockFade: false,        // fade the panel down while the pointer is somewhere else
     panelTotals: true,      // totals line injected into YouTube's native queue panel
     panelKeepOpen: true,    // re-expand the native panel if YouTube collapses it
     panelHandles: true,     // keep the native drag handles permanently visible
@@ -155,7 +166,16 @@
     } catch (e) { /* storage blocked — fall through to defaults */ }
     let parsed = {};
     try { parsed = typeof raw === 'string' ? JSON.parse(raw) : (raw || {}); } catch (e) { parsed = {}; }
-    return Object.assign({}, DEFAULTS, parsed && typeof parsed === 'object' ? parsed : {});
+    const p = Object.assign({}, DEFAULTS, parsed && typeof parsed === 'object' ? parsed : {});
+
+    // v0.2 stored a boolean `dockOpen` and a single `dockHeight`. v0.3 has three window states and
+    // its own width/height pair, so migrate rather than silently resetting someone's panel.
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.dockState == null && parsed.dockOpen != null) p.dockState = parsed.dockOpen ? 'open' : 'pill';
+      if (parsed.dockH == null && parsed.dockHeight != null) p.dockH = parsed.dockHeight;
+    }
+    if (['open', 'shaded', 'pill'].indexOf(p.dockState) < 0) p.dockState = 'open';
+    return p;
   }
 
   function writePrefs(p) {
@@ -781,8 +801,7 @@
     if (e.altKey && e.shiftKey) {
       e.preventDefault();
       if (!prefs.dock) setPref('dock', true);
-      setPref('dockOpen', !prefs.dockOpen);
-      renderDock(true);
+      setDockState(prefs.dockState === 'pill' ? (lastOpenState === 'pill' ? 'open' : lastOpenState) : 'pill');
       return;
     }
     if (!prefs.hotkeys || e.altKey) return;
@@ -820,36 +839,58 @@
   // ===========================================================================
   let dockEl = null;
   let lastSignature = '';
+  // Which state the pill restores to. Remembered so rolling up, then minimizing, then reopening
+  // doesn't quietly throw away the rolled-up preference.
+  let lastOpenState = 'open';
+
+  const RESIZE_DIRS = ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw'];
 
   function ensureDock() {
     if (dockEl && dockEl.isConnected) return dockEl;
     if (!document.body) return null;
 
     dockEl = el('div', 'ytq-dock');
-    dockEl.appendChild(el('div', 'ytq-grip')).title = 'Drag to resize';
 
     const head = el('div', 'ytq-head');
+    head.title = 'Drag to move · double-click to park it back in the corner';
     head.appendChild(el('span', 'ytq-h-title', 'Queue'));
     head.appendChild(el('span', 'ytq-h-count'));
     head.appendChild(el('span', 'ytq-h-spacer'));
     head.appendChild(headButton('clear', 'Clear', 'Clear the queue'));
-    head.appendChild(headButton('collapse', '▾', 'Collapse'));
+    head.appendChild(headButton('shade', '▾', 'Roll up to the title bar'));
+    head.appendChild(headButton('pill', '–', 'Minimize to a pill'));
     dockEl.appendChild(head);
 
     dockEl.appendChild(el('ol', 'ytq-list'));
     dockEl.appendChild(el('div', 'ytq-foot'));
 
+    // Eight resize hit-zones, inset just far enough to sit inside the border. They are invisible by
+    // design — only the bottom-right corner draws a grip, which is enough to say "this resizes"
+    // without putting eight visible chevrons on a panel that lives over someone's video.
+    for (const dir of RESIZE_DIRS) {
+      const h = el('div', 'ytq-rz ytq-rz-' + dir);
+      h.dataset.ytqResize = dir;
+      dockEl.appendChild(h);
+    }
+
     const pill = el('button', 'ytq-pill');
     pill.type = 'button';
-    pill.title = 'Show queue (Alt+Shift+Q)';
-    pill.addEventListener('click', () => { setPref('dockOpen', true); renderDock(true); });
+    pill.title = 'Show the queue (Alt+Shift+Q) · drag to move it';
     dockEl.appendChild(pill);
 
     dockEl.addEventListener('click', onDockClick);
+    wireMove(dockEl, head, pill);
     wireResize(dockEl);
     wireDockDrag(dockEl);
     document.body.appendChild(dockEl);
     return dockEl;
+  }
+
+  /** Switch window state, remembering the last non-pill one so the pill knows what to restore. */
+  function setDockState(next) {
+    if (prefs.dockState !== 'pill') lastOpenState = prefs.dockState;
+    setPref('dockState', next);
+    renderDock(true);
   }
 
   function headButton(action, label, title) {
@@ -869,7 +910,8 @@
     const row = btn.closest('.ytq-row');
     const index = row ? Number(row.dataset.index) : -1;
 
-    if (action === 'collapse') { setPref('dockOpen', false); renderDock(true); return; }
+    if (action === 'shade') { setDockState(prefs.dockState === 'shaded' ? 'open' : 'shaded'); return; }
+    if (action === 'pill') { setDockState('pill'); return; }
     if (action === 'clear') {
       if (window.confirm('Clear the whole queue?')) {
         const status = clearQueue();
@@ -943,31 +985,203 @@
     dock.addEventListener('dragend', () => { clearMarks(); dragFrom = -1; });
   }
 
-  function wireResize(dock) {
-    const grip = dock.querySelector('.ytq-grip');
-    let startY = 0, startH = 0, dragging = false;
-    grip.addEventListener('mousedown', (e) => {
-      dragging = true; startY = e.clientY; startH = prefs.dockHeight;
+  // ===========================================================================
+  // Window geometry: where the panel sits, and how big it is.
+  //
+  // Two coordinate modes. Until you first move or resize it, the panel is PARKED — anchored to a
+  // corner with `bottom`/`right` in CSS, so it stays put when the browser window changes size. The
+  // moment you grab it, `pinPanel` measures where it actually is and switches to explicit left/top,
+  // because resize arithmetic against a bottom-right anchor is ambiguous: dragging the east edge
+  // rightwards cannot move an edge that is pinned to the right of the viewport. Everything after
+  // that lives in one plain left/top/width/height space.
+  // ===========================================================================
+  const MIN_W = 250;         // px — narrower than this and the rows stop making sense
+  const MIN_LIST_H = 90;     // px of list; the head and foot sit outside this
+  const CHROME_H = 78;       // approximate head + foot height, used only to clamp the maximum
+  const KEEP_ON_SCREEN = 90; // px of the panel that must stay reachable, wherever it was dropped
+
+  function pinPanel(dock) {
+    if (prefs.dockX != null && prefs.dockY != null) return;
+    const box = dock.getBoundingClientRect();
+    prefs.dockX = Math.round(box.left);
+    prefs.dockY = Math.round(box.top);
+  }
+
+  /** Keep a grabbable corner on screen no matter where the thing was dropped. */
+  function clampToViewport(x, y, w) {
+    return {
+      x: Math.round(Math.max(KEEP_ON_SCREEN - w, Math.min(window.innerWidth - KEEP_ON_SCREEN, x))),
+      y: Math.round(Math.max(0, Math.min(window.innerHeight - 34, y))),
+    };
+  }
+
+  /** Push position and size onto the element. Runs on every render and every drag frame. */
+  function applyGeometry(dock) {
+    const asPill = prefs.dockState === 'pill';
+    const x = asPill ? prefs.pillX : prefs.dockX;
+    const y = asPill ? prefs.pillY : prefs.dockY;
+    dock.dataset.placed = (x != null && y != null) ? '1' : '0';
+    if (x != null && y != null) {
+      dock.style.left = x + 'px';
+      dock.style.top = y + 'px';
+      dock.style.right = 'auto';
+      dock.style.bottom = 'auto';
+    } else {
+      // Clear the inline values so the parked-in-a-corner CSS wins again.
+      dock.style.left = dock.style.top = dock.style.right = dock.style.bottom = '';
+    }
+    dock.style.setProperty('--ytq-w', prefs.dockW + 'px');
+    dock.style.setProperty('--ytq-h', prefs.dockH + 'px');
+  }
+
+  function resetPlacement() {
+    ['dockX', 'dockY', 'pillX', 'pillY'].forEach((k) => setPref(k, null));
+    setPref('dockW', DEFAULTS.dockW);
+    setPref('dockH', DEFAULTS.dockH);
+    renderDock(true);
+    toast('Panel put back in its corner');
+  }
+
+  /** A shrinking window can strand a placed panel off-screen. Pull it back into reach. */
+  function reclampPlacement() {
+    if (!dockEl) return;
+    if (prefs.dockX != null) {
+      const c = clampToViewport(prefs.dockX, prefs.dockY, prefs.dockW);
+      prefs.dockX = c.x; prefs.dockY = c.y;
+    }
+    if (prefs.pillX != null) {
+      const c = clampToViewport(prefs.pillX, prefs.pillY, 120);
+      prefs.pillX = c.x; prefs.pillY = c.y;
+    }
+    prefs.dockW = Math.max(MIN_W, Math.min(prefs.dockW, window.innerWidth - 24));
+    prefs.dockH = Math.max(MIN_LIST_H, Math.min(prefs.dockH, window.innerHeight - CHROME_H - 16));
+    applyGeometry(dockEl);
+    writePrefs(prefs);
+  }
+
+  /**
+   * Drag the panel by its title bar, and the pill by itself.
+   *
+   * Pointer events, deliberately, and NOT HTML5 drag-and-drop: the rows already use DnD to reorder,
+   * and the two mechanisms fight over the same gesture when they share a surface. Pointer capture
+   * is what keeps a drag alive once the cursor crosses the video or one of YouTube's iframes.
+   */
+  function wireMove(dock, head, pill) {
+    let drag = null;
+
+    function start(e, kind, node) {
+      if (e.button !== 0) return;
+      if (kind === 'panel' && e.target.closest && e.target.closest('button')) return; // buttons stay buttons
+      if (kind === 'panel') pinPanel(dock);
+      const box = node.getBoundingClientRect();
+      drag = {
+        kind, w: box.width,
+        ox: e.clientX - box.left, oy: e.clientY - box.top,
+        x0: e.clientX, y0: e.clientY, moved: false,
+      };
+      safe(() => e.currentTarget.setPointerCapture(e.pointerId));
+      document.body.classList.add('ytq-moving');
+    }
+
+    function move(e) {
+      if (!drag) return;
+      // A few px of slop, so a click on the pill stays a click and not a one-pixel drag.
+      if (!drag.moved && Math.abs(e.clientX - drag.x0) + Math.abs(e.clientY - drag.y0) < 4) return;
+      drag.moved = true;
       e.preventDefault();
+      const c = clampToViewport(e.clientX - drag.ox, e.clientY - drag.oy, drag.w);
+      if (drag.kind === 'pill') { prefs.pillX = c.x; prefs.pillY = c.y; }
+      else { prefs.dockX = c.x; prefs.dockY = c.y; }
+      applyGeometry(dock);
+    }
+
+    function end(e) {
+      if (!drag) return;
+      const kind = drag.kind, moved = drag.moved;
+      drag = null;
+      document.body.classList.remove('ytq-moving');
+      safe(() => e.currentTarget.releasePointerCapture(e.pointerId));
+      if (kind === 'pill') {
+        setPref('pillX', prefs.pillX);
+        setPref('pillY', prefs.pillY);
+        if (!moved) setDockState(lastOpenState === 'pill' ? 'open' : lastOpenState);
+      } else {
+        setPref('dockX', prefs.dockX);
+        setPref('dockY', prefs.dockY);
+      }
+    }
+
+    [[head, 'panel', dock], [pill, 'pill', pill]].forEach((entry) => {
+      const node = entry[0], kind = entry[1], box = entry[2];
+      node.addEventListener('pointerdown', (e) => start(e, kind, box));
+      node.addEventListener('pointermove', move);
+      node.addEventListener('pointerup', end);
+      node.addEventListener('pointercancel', end);
+    });
+
+    head.addEventListener('dblclick', (e) => {
+      if (!(e.target.closest && e.target.closest('button'))) resetPlacement();
+    });
+  }
+
+  /**
+   * Resize from any edge or corner. The north and west handles move the panel as well as size it,
+   * so the edge you are not dragging stays exactly where you put it.
+   *
+   * `dockH` is the LIST's height rather than the whole panel's, because that is what the CSS wants.
+   * The head and foot are fixed, so the arithmetic is identical either way.
+   */
+  function wireResize(dock) {
+    let rz = null;
+
+    dock.addEventListener('pointerdown', (e) => {
+      const h = e.target.closest && e.target.closest('[data-ytq-resize]');
+      if (!h || e.button !== 0 || prefs.dockState === 'pill') return;
+      pinPanel(dock);
+      rz = {
+        dir: h.dataset.ytqResize, x: e.clientX, y: e.clientY,
+        w: prefs.dockW, h: prefs.dockH, left: prefs.dockX, top: prefs.dockY,
+      };
+      safe(() => h.setPointerCapture(e.pointerId));
       document.body.classList.add('ytq-resizing');
+      e.preventDefault();
+      e.stopPropagation();
     });
-    window.addEventListener('mousemove', (e) => {
-      if (!dragging) return;
-      const h = Math.max(140, Math.min(760, startH + (startY - e.clientY)));
-      dock.style.setProperty('--ytq-dock-h', h + 'px');
-      prefs.dockHeight = h;
+
+    dock.addEventListener('pointermove', (e) => {
+      if (!rz) return;
+      const dx = e.clientX - rz.x, dy = e.clientY - rz.y;
+      const maxW = window.innerWidth - 16;
+      const maxH = window.innerHeight - CHROME_H - 16;
+      if (rz.dir.indexOf('e') >= 0) prefs.dockW = Math.max(MIN_W, Math.min(maxW, rz.w + dx));
+      if (rz.dir.indexOf('w') >= 0) {
+        const w = Math.max(MIN_W, Math.min(maxW, rz.w - dx));
+        prefs.dockX = rz.left + (rz.w - w);
+        prefs.dockW = w;
+      }
+      if (rz.dir.indexOf('s') >= 0) prefs.dockH = Math.max(MIN_LIST_H, Math.min(maxH, rz.h + dy));
+      if (rz.dir.indexOf('n') >= 0) {
+        const h = Math.max(MIN_LIST_H, Math.min(maxH, rz.h - dy));
+        prefs.dockY = rz.top + (rz.h - h);
+        prefs.dockH = h;
+      }
+      applyGeometry(dock);
     });
-    window.addEventListener('mouseup', () => {
-      if (!dragging) return;
-      dragging = false;
+
+    const stop = (e) => {
+      if (!rz) return;
+      rz = null;
       document.body.classList.remove('ytq-resizing');
-      setPref('dockHeight', prefs.dockHeight);
-    });
+      safe(() => e.target.releasePointerCapture(e.pointerId));
+      ['dockW', 'dockH', 'dockX', 'dockY'].forEach((k) => setPref(k, prefs[k]));
+    };
+    dock.addEventListener('pointerup', stop);
+    dock.addEventListener('pointercancel', stop);
   }
 
   function queueSignature(items, snap) {
     return [
-      prefs.dockOpen ? 'o' : 'c',
+      prefs.dockState,
       prefs.dockSide,
       items.map((i) => i.videoId).join(','),
       YT.currentIndex(),
@@ -990,9 +1204,17 @@
     const dock = ensureDock();
     if (!dock) return;
     dock.style.display = '';
-    dock.style.setProperty('--ytq-dock-h', prefs.dockHeight + 'px');
-    dock.dataset.open = prefs.dockOpen ? '1' : '0';
+    dock.dataset.state = prefs.dockState;
     dock.dataset.side = prefs.dockSide === 'left' ? 'left' : 'right';
+    dock.dataset.fade = prefs.dockFade ? '1' : '0';
+    applyGeometry(dock);
+
+    const shade = dock.querySelector('[data-ytq-dock="shade"]');
+    if (shade) {
+      const rolled = prefs.dockState === 'shaded';
+      shade.textContent = rolled ? '▴' : '▾';
+      shade.title = rolled ? 'Show the list again' : 'Roll up to the title bar';
+    }
 
     const current = YT.currentIndex();
     const list = dock.querySelector('.ytq-list');
@@ -1027,7 +1249,10 @@
       `${items.length} · ${clock(t.total)}${t.unknown ? ` +${t.unknown} live` : ''}`;
 
     items.forEach((it, i) => {
-      const li = el('li', 'ytq-row' + (i === current ? ' ytq-now' : '') + (i < current ? ' ytq-past' : ''));
+      // Nothing before the current row is dimmed. A queue is not necessarily played front to
+      // back, so "earlier in the list" does not mean "already watched" — only the row that is
+      // actually playing gets marked.
+      const li = el('li', 'ytq-row' + (i === current ? ' ytq-now' : ''));
       li.dataset.index = String(i);
       li.draggable = true;
 
@@ -1172,24 +1397,61 @@
 
   /* --- dock ------------------------------------------------------------- */
   .ytq-dock {
-    --ytq-dock-h: 330px;
-    position: fixed; bottom: 16px; z-index: 2300;
-    width: 340px; display: flex; flex-direction: column;
+    --ytq-w: 340px; --ytq-h: 330px;
+    position: fixed; z-index: 2300;
+    width: var(--ytq-w); display: flex; flex-direction: column;
     border-radius: 12px; overflow: hidden;
     background: var(--yt-spec-menu-background, #212121);
     color: var(--yt-spec-text-primary, #f1f1f1);
     border: 1px solid var(--yt-spec-10-percent-layer, rgba(255,255,255,.12));
     box-shadow: 0 8px 28px rgba(0,0,0,.45);
     font-family: "Roboto", Arial, sans-serif;
+    transition: opacity .2s ease;
   }
-  .ytq-dock[data-side="right"] { right: 16px; }
-  .ytq-dock[data-side="left"]  { left: 16px; }
-  .ytq-dock[data-open="0"] { width: auto; border: 0; background: transparent; box-shadow: none; }
-  .ytq-dock[data-open="0"] .ytq-grip,
-  .ytq-dock[data-open="0"] .ytq-head,
-  .ytq-dock[data-open="0"] .ytq-list,
-  .ytq-dock[data-open="0"] .ytq-foot { display: none; }
-  .ytq-dock[data-open="1"] .ytq-pill { display: none; }
+  /* Parked in a corner until it is first dragged; after that JS supplies left/top. */
+  .ytq-dock[data-placed="0"] { bottom: 16px; }
+  .ytq-dock[data-placed="0"][data-side="right"] { right: 16px; }
+  .ytq-dock[data-placed="0"][data-side="left"]  { left: 16px; }
+
+  /* Optional: get out of the way of the video, come back on hover. */
+  .ytq-dock[data-fade="1"]:not(:hover) { opacity: .3; }
+  body.ytq-moving .ytq-dock, body.ytq-resizing .ytq-dock { opacity: 1 !important; transition: none; }
+
+  /* Rolled up to the title bar. Only the side handles stay live, so width is still adjustable. */
+  .ytq-dock[data-state="shaded"] .ytq-list,
+  .ytq-dock[data-state="shaded"] .ytq-foot,
+  .ytq-dock[data-state="shaded"] .ytq-rz-n,
+  .ytq-dock[data-state="shaded"] .ytq-rz-s,
+  .ytq-dock[data-state="shaded"] .ytq-rz-ne,
+  .ytq-dock[data-state="shaded"] .ytq-rz-nw,
+  .ytq-dock[data-state="shaded"] .ytq-rz-se,
+  .ytq-dock[data-state="shaded"] .ytq-rz-sw { display: none; }
+  .ytq-dock[data-state="shaded"] .ytq-head { border-bottom: 0; }
+
+  /* Minimized to a pill. */
+  .ytq-dock[data-state="pill"] { width: auto; border: 0; background: transparent; box-shadow: none; }
+  .ytq-dock[data-state="pill"] .ytq-head,
+  .ytq-dock[data-state="pill"] .ytq-list,
+  .ytq-dock[data-state="pill"] .ytq-foot,
+  .ytq-dock[data-state="pill"] .ytq-rz { display: none; }
+  .ytq-dock:not([data-state="pill"]) .ytq-pill { display: none; }
+
+  /* Resize hit-zones: felt, not seen — except the bottom-right corner, which draws a grip. */
+  .ytq-rz { position: absolute; z-index: 4; touch-action: none; }
+  .ytq-rz-n  { top: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+  .ytq-rz-s  { bottom: 0; left: 10px; right: 10px; height: 6px; cursor: ns-resize; }
+  .ytq-rz-w  { left: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+  .ytq-rz-e  { right: 0; top: 10px; bottom: 10px; width: 6px; cursor: ew-resize; }
+  .ytq-rz-nw { top: 0; left: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+  .ytq-rz-ne { top: 0; right: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+  .ytq-rz-sw { bottom: 0; left: 0; width: 14px; height: 14px; cursor: nesw-resize; }
+  .ytq-rz-se { bottom: 0; right: 0; width: 16px; height: 16px; cursor: nwse-resize; }
+  .ytq-rz-se::after {
+    content: ""; position: absolute; inset: 4px 4px 3px 4px; opacity: .3;
+    border-right: 2px solid var(--yt-spec-text-secondary, #aaa);
+    border-bottom: 2px solid var(--yt-spec-text-secondary, #aaa);
+  }
+  .ytq-dock:hover .ytq-rz-se::after { opacity: .75; }
 
   .ytq-pill {
     padding: 9px 15px; border-radius: 999px; cursor: pointer;
@@ -1198,19 +1460,18 @@
     font: 500 13px/1 "Roboto", Arial, sans-serif;
     box-shadow: 0 4px 16px rgba(0,0,0,.45);
     border: 1px solid var(--yt-spec-10-percent-layer, rgba(255,255,255,.12));
+    cursor: grab; touch-action: none;
   }
   .ytq-pill:hover { filter: brightness(1.15); }
 
-  .ytq-grip { height: 7px; cursor: ns-resize; flex: 0 0 auto; background: transparent; }
-  .ytq-grip::after {
-    content: ""; display: block; width: 34px; height: 3px; margin: 2px auto 0; border-radius: 2px;
-    background: var(--yt-spec-text-secondary, #aaa); opacity: .4;
-  }
-  body.ytq-resizing { user-select: none; }
+  body.ytq-resizing, body.ytq-moving { user-select: none; }
+  body.ytq-moving .ytq-head, body.ytq-moving .ytq-pill { cursor: grabbing; }
 
+  /* The title bar is the move handle. */
   .ytq-head {
-    display: flex; align-items: center; gap: 8px; padding: 4px 10px 8px;
+    display: flex; align-items: center; gap: 8px; padding: 7px 10px 8px;
     border-bottom: 1px solid var(--yt-spec-10-percent-layer, rgba(255,255,255,.12));
+    cursor: grab; touch-action: none;
   }
   .ytq-h-title { font-size: 14px; font-weight: 600; }
   .ytq-h-count { font-size: 12px; color: var(--yt-spec-text-secondary, #aaa); }
@@ -1232,14 +1493,13 @@
 
   .ytq-list {
     list-style: none; margin: 0; padding: 4px; overflow-y: auto; overflow-x: hidden;
-    height: var(--ytq-dock-h); flex: 1 1 auto; scrollbar-width: thin;
+    height: var(--ytq-h); flex: 1 1 auto; scrollbar-width: thin;
   }
   .ytq-row {
     display: flex; align-items: center; gap: 7px; padding: 4px; border-radius: 8px; cursor: grab;
   }
   .ytq-row:hover { background: var(--yt-spec-10-percent-layer, rgba(255,255,255,.09)); }
   .ytq-row.ytq-now { background: var(--yt-spec-10-percent-layer, rgba(255,255,255,.14)); }
-  .ytq-row.ytq-past .ytq-thumb, .ytq-row.ytq-past .ytq-meta { opacity: .5; }
   .ytq-row.ytq-dragging { opacity: .4; }
   .ytq-row.ytq-over { box-shadow: inset 0 2px 0 var(--yt-spec-text-primary, #f1f1f1); }
   .ytq-row.ytq-over-below { box-shadow: inset 0 -2px 0 var(--yt-spec-text-primary, #f1f1f1); }
@@ -1360,10 +1620,18 @@
     });
     add(`⌨️ Q hotkey: ${onOff(prefs.hotkeys)}`, () => setPref('hotkeys', !prefs.hotkeys));
     add(`📋 Floating queue panel: ${onOff(prefs.dock)}`, () => { setPref('dock', !prefs.dock); renderDock(true); });
-    add(`↔️ Panel side: ${prefs.dockSide}`, () => {
+    add(`↔️ Panel parks on the: ${prefs.dockSide}`, () => {
       setPref('dockSide', prefs.dockSide === 'right' ? 'left' : 'right');
+      // Side only decides the parking corner, so choosing one un-places a dragged panel.
+      setPref('dockX', null);
+      setPref('dockY', null);
       renderDock(true);
     });
+    add(`🌫️ Fade the panel while you watch: ${onOff(prefs.dockFade)}`, () => {
+      setPref('dockFade', !prefs.dockFade);
+      renderDock(true);
+    });
+    add('📍 Reset panel position and size', resetPlacement);
     add(`🙈 Hide YouTube's own queue panel: ${onOff(prefs.hideNativePanel)}`, () => {
       setPref('hideNativePanel', !prefs.hideNativePanel);
       injectStyles();
@@ -1393,8 +1661,11 @@
     const probe = items.findIndex((it, i) => i !== current && !it.selected);
 
     const report = {
-      version: '0.2.0',
+      version: VERSION,
       page: location.pathname,
+      'panel state': prefs.dockState,
+      'panel geometry': `${prefs.dockW}x${prefs.dockH} @ ` +
+        (prefs.dockX == null ? `parked ${prefs.dockSide}` : `${prefs.dockX},${prefs.dockY}`),
       'add: ytd-app.resolveCommand': !!(YT.app() && typeof YT.app().resolveCommand === 'function'),
       'read: yt-playlist-manager': !!YT.manager(),
       'queue items visible': items.length,
@@ -1428,12 +1699,16 @@
 
     // Snapshot on a timer rather than per-mutation: the queue changes rarely, and a timer also
     // catches changes made through YouTube's own UI, not just ours.
+    // A resized browser window can leave a placed panel hanging off the edge.
+    window.addEventListener('resize', debounceRaf(() => safe(reclampPlacement)));
+
     setInterval(() => { safe(snapshotQueue); safe(() => renderDock(false)); }, 3000);
     setTimeout(() => safe(maybeAutoRestore), 2500);
 
     // Debug handle. Deliberately not part of the page's API surface.
     safe(() => Object.defineProperty(window, '__ytq', {
-      value: { YT, addToQueue, playNext, moveItem, removeAt, clearQueue, diagnostics, prefs },
+      value: { YT, addToQueue, playNext, moveItem, removeAt, clearQueue, diagnostics,
+               resetPlacement, setDockState, prefs },
       configurable: true,
     }));
     log('ready — Q queues the hovered video, Shift+Q plays it next, Alt+Shift+Q toggles the panel');

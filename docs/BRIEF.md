@@ -263,15 +263,57 @@ trade.
 | Shift-click (or Alt / middle-click) any video link to queue | Capture-phase, so YouTube's navigation never fires |
 | `Q` / `Shift+Q` on the hovered video | Ignored while typing; `q` is unbound by YouTube |
 | `Alt+Shift+Q` toggles the floating panel | Works with nothing hovered |
-| Floating queue panel on every page | Collapsible to a pill, drag-resizable, left/right |
+| Floating queue panel on every page | v0.3.0: a real window — see below |
 | Running totals (count, total runtime, time left) | Both in the dock and injected into the native panel |
 | One-click remove per row | Native endpoint, rebuild fallback |
 | Drag reorder | Both panels |
 | Always-visible native reorder handles | Pure CSS over a capability YouTube already had |
 | Keep native panel expanded | |
 | Hide YouTube's own queue panel (v0.2.0) | `display:none`, **never** removal — the panel staying in the DOM is what keeps the fast `handleDrop` reorder available. Verified: reorder still works, and the player stays in sync, while hidden |
+| Move the panel anywhere; resize from 8 handles (v0.3.0) | Pointer events, not DnD — see below |
+| Three window states: open / rolled up / pill (v0.3.0) | `dockState`, migrated from v0.2's `dockOpen` |
+| Optional idle fade (v0.3.0) | Pure CSS `:hover`, off by default |
 | Snapshot + restore after reload | One command; verified in exact order |
 | Diagnostics | Reports which of the four primitives are live |
+
+### The panel is a window (v0.3.0)
+
+Three decisions worth not re-litigating.
+
+**Two coordinate modes, and a one-way transition.** Until it is first touched the panel is *parked*:
+CSS anchors it with `bottom: 16px` and `right`/`left: 16px`, so it stays in its corner when the
+browser window changes size, which is the right default. But resize arithmetic against that anchor
+is ambiguous — dragging the east edge rightwards cannot move an edge that is pinned to the right of
+the viewport. So the first move or resize calls `pinPanel`, which measures where the panel actually
+is and switches it to explicit `left`/`top` (`data-placed="1"`). Everything after that lives in one
+plain left/top/width/height space. Double-clicking the title bar, or switching the parking side from
+the menu, drops back to parked by nulling `dockX`/`dockY`.
+
+**Pointer events, never HTML5 drag-and-drop.** The rows already use DnD to reorder. The two
+mechanisms fight over the same gesture when they share a surface, and DnD additionally cannot report
+a live position — you would get a drop point, not a drag. `setPointerCapture` is what keeps a drag
+alive once the cursor crosses the video or one of YouTube's iframes; it is wrapped in `safe()`
+because synthetic pointer events (tests) have no active pointer to capture.
+
+**`dockH` is the LIST's height, not the panel's.** The CSS puts `--ytq-h` on `.ytq-list`, with the
+head and foot outside it at fixed heights, so the two differ by a constant and the resize maths is
+identical either way. The north and west handles adjust position *and* size together, so the edge
+you are not dragging stays exactly where you put it.
+
+`clampToViewport` keeps `KEEP_ON_SCREEN` (90px) of the panel reachable no matter where it was
+dropped, and `reclampPlacement` re-runs it on `window.resize`, because a shrinking window can
+otherwise strand a placed panel off the edge with no way to grab it back.
+
+### Nothing is greyed out (v0.3.0)
+
+v0.1.0 dimmed every row above `currentIndex` to 50% via a `.ytq-past` class. That encodes an
+assumption the script has no business making: that a queue is played front to back, so anything
+earlier has been watched. It hasn't, necessarily — people jump around their own queues. The class is
+gone; only `.ytq-now` (the row that is actually playing) is marked.
+
+Note that the footer's *"N after this · X left"* readout carries the same sequential assumption. It
+was left alone on purpose — it is a statement about playing straight through from here, which is a
+real thing to want to know, and unlike the dimming it doesn't make the other rows look spent.
 
 ### Thumbnail discovery is structural, not a selector list
 
@@ -345,6 +387,35 @@ Prompted by "dragging-to-reorder isn't working very well". Queue empty before an
 | Reorder still works with the panel `display:none` | ✅ order correct, player in sync |
 | Clear button present on `/feed/subscriptions` | ❌ panel in DOM but header not rendered — the `'partial'` fallback is what covers this |
 
+### v0.3.0 pass — 2026-09-04 (local harness)
+
+The window work touches none of the four primitives, so it was verified against a harness that stubs
+`yt-playlist-manager.getPlaylistData()` with a ten-item `TLPQ` queue rather than against a live
+account. `scratch/harness.html` (gitignored) is that harness; serve the repo root over HTTP and open
+it. **Not yet given a live-YouTube pass.**
+
+| Check | Result |
+| --- | --- |
+| Title-bar drag, synthetic pointer events | ✅ landed exactly on target; `data-placed` flipped to 1 |
+| Title-bar drag, real mouse across the whole viewport | ✅ pointer capture held; grab offset preserved |
+| Resize `e` / `s` — opposite edge stays fixed | ✅ |
+| Resize `w` / `n` — opposite edge stays fixed, panel moves | ✅ |
+| Resize `se` / `nw` corners | ✅ both axes, anchor corner fixed |
+| Geometry persists across the drag end | ✅ `dockX/Y/W/H` written on pointerup |
+| Three states: open 552×595, shaded 552×**39**, pill 104×33 | ✅ |
+| Pill click restores the *remembered* state (shaded, not open) | ✅ |
+| Pill keeps its own position; panel's is untouched | ✅ |
+| `Alt+Shift+Q` cycles pill ⇄ last open state | ✅ |
+| Dropped far off bottom-right → clamped to 90px reachable | ✅ |
+| Dropped far off top-left → right edge stays on screen | ✅ |
+| Double-click title bar → parked, default size | ✅ |
+| Header buttons do not start a panel move | ✅ no stuck `ytq-moving` |
+| Row drag-to-reorder still fires; thumbnails still `draggable=false` | ✅ v0.2.0 fix intact |
+| No `.ytq-past`; every row's `.ytq-meta` at opacity 1 | ✅ |
+| v0.2 prefs (`dockOpen:false`, `dockHeight:512`) migrate | ✅ → `dockState:'pill'`, `dockH:512` |
+
+---
+
 A note on session health: partway through testing, the signed-out session started returning `400`
 from the queue APIs and *every* add failed, including ones that had worked minutes earlier. That was
 YouTube throttling an anonymous session, not a script fault — a fresh load restored normal behaviour.
@@ -369,6 +440,9 @@ Worth remembering before chasing a phantom bug.
 - **Bulk actions.** "Queue everything in this row / this search / this playlist" — cheap now, since
   `videoIds` takes an array. Needs a UI that can't be fired by accident.
 - **Shuffle / sort the queue**, and de-duplicate.
-- **Watched markers** in the panel.
+- **Watched markers** in the panel. Note this is *not* the dimming that v0.3.0 removed: a real
+  watched marker would come from YouTube's own progress data, not from an item's position in the
+  list.
+- **Snap the panel to screen edges** while dragging, and remember a per-page-type position.
 - **YouTube Music / `m.youtube.com`** — different app shells; out of scope until the desktop side is
   settled.
