@@ -392,7 +392,7 @@ Prompted by "dragging-to-reorder isn't working very well". Queue empty before an
 The window work touches none of the four primitives, so it was verified against a harness that stubs
 `yt-playlist-manager.getPlaylistData()` with a ten-item `TLPQ` queue rather than against a live
 account. `scratch/harness.html` (gitignored) is that harness; serve the repo root over HTTP and open
-it. **Not yet given a live-YouTube pass.**
+it. **Superseded by the v0.3.1 live pass below, which found one defect the harness could not see.**
 
 | Check | Result |
 | --- | --- |
@@ -413,6 +413,74 @@ it. **Not yet given a live-YouTube pass.**
 | Row drag-to-reorder still fires; thumbnails still `draggable=false` | ✅ v0.2.0 fix intact |
 | No `.ytq-past`; every row's `.ytq-meta` at opacity 1 | ✅ |
 | v0.2 prefs (`dockOpen:false`, `dockHeight:512`) migrate | ✅ → `dockState:'pill'`, `dockH:512` |
+
+### v0.3.1 pass — 2026-09-06 (real account, Edge on SylG5, live YouTube)
+
+The live pass v0.3.0 never got. Signed in on the user's own account; **the queue was empty
+throughout and was never touched**, and the 19-item saved snapshot was left intact — every check
+below is either window geometry or read-only, and `snapshotQueue()`'s `if (!items.length) return`
+guard is what makes that safe.
+
+| Check | Result |
+| --- | --- |
+| Panel renders on live YouTube at v0.3.0 | ✅ `.ytq-dock` present, `z-index: 2300` |
+| All 8 resize handles present with real hit-boxes | ✅ n/s/e/w 6px edges, corners 12–16px |
+| Title-bar drag, **real mouse**, across the page | ✅ grab offset preserved to the pixel (74,19 in → 74,19 out) |
+| Resize `e` — opposite edge fixed | ✅ w 342→442, left stayed 246 |
+| Resize `n` — opposite edge fixed, panel moves | ✅ y 201→151, bottom stayed 594 |
+| Resize `w` — opposite edge fixed, panel moves | ✅ x 246→196, right stayed 688 |
+| Three states: open, shaded **39px**, pill 109×33 | ✅ matches the harness figures |
+| Unshade restores the previous width/height | ✅ 492×443 both sides of the toggle |
+| Pill keeps its own parked position; panel's untouched | ✅ pill at the corner, panel still remembered (196,151) |
+| Pill click restores the remembered state *and* geometry | ✅ back to open at 196,151,492,443 |
+| `Alt+Shift+Q` cycles pill ⇄ last open state | ✅ geometry preserved across the round trip |
+| Double-click title bar → parked, fully on screen | ✅ `placed` 1→0, 16px margins |
+| No stuck `ytq-moving` / `ytq-resizing` after any gesture | ✅ |
+| No `.ytq-past` anywhere | ✅ 0 occurrences in source; only `.ytq-now` survives |
+
+#### The defect the harness could not see
+
+**Restoring a placed panel never reconciled its geometry with the current viewport.** Observed on
+the very first open of the session, from the user's own persisted prefs: the panel came back at
+(908, 668) at 342×419 in a 1149×940 viewport — **101px past the right edge, 147px past the bottom,
+with the Discard button clipped at x=1152.** The user had done nothing but click the pill.
+
+Reproduced deterministically: place the panel, grow it to 872px tall so its bottom hangs 113px below
+the fold, reload → it renders in exactly that spot again, `fullyOnScreen: false`. Nothing pulls it
+back.
+
+Two causes, and the first one alone is not the whole story:
+
+1. `reclampPlacement` was wired **only** to `window.resize`. Loading the page in a window smaller
+   than the one the geometry was saved in fires no resize event at all, so nothing ran.
+2. More importantly, running it would not have helped. Its guarantee is `clampToViewport`'s — that
+   `KEEP_ON_SCREEN` (90px) stays grabbable — and for the observed case (y=668, viewport 940) that
+   clamps `y` to `min(940-34, 668)` = **668, unchanged**. The panel would still have hung off the
+   bottom. The reachability rule is the right rule for a panel the user *dropped* somewhere odd;
+   it is the wrong rule for one restored from storage, which the user never positioned here at all.
+
+Fixed in v0.3.1 by `fitPlacement()`: when the panel *fits* the viewport, seat it fully inside with
+an `EDGE_GAP` margin; when it nearly fills it, seat it flush rather than giving up; when it
+genuinely cannot fit, fall back to the old reachability guarantee. It runs inside
+`reclampPlacement` — after the size clamps, since it positions against them — and
+`reclampPlacement` is now also called once from `ensureDock`, when the panel is first built.
+
+Checked against the measured numbers: the session-start failure (908,668) seats to (793,490); the
+tall repro seats to y=52 (bottom 924); a panel taller than its viewport seats flush at y=0; **and a
+panel that was already fully on screen does not move.** That last one is the point — this must not
+relocate panels the user deliberately placed.
+
+#### Harness notes for next time
+
+- **Synthetic multi-hop drags under-travel.** Single `left_click_drag` calls landed pixel-exact, but
+  three chained hops downward moved the panel ~83px out of an intended ~548. Trust single drags;
+  verify positions by measurement, never by assuming the drop landed where it was aimed.
+- **`window.__ytq` is not reachable from page context** — Tampermonkey sandboxes it away because of
+  the `@grant`s. Driving prefs directly from a devtools/automation context is not available; go
+  through the UI.
+- **A maximized window ignores resize requests**, so "shrink the viewport" is not a usable way to
+  reproduce stale-geometry bugs here. Growing the panel past the viewport with its own `s` handle
+  is, and needs no window changes.
 
 ---
 

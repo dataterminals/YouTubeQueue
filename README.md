@@ -133,7 +133,10 @@ on the current page. That's the fastest way to tell "YouTube changed something" 
 - The v0.3.0 window changes (move, resize, roll up, minimize) touch none of those four paths. They
   were verified on **2026-09-04** against a local harness that stubs YouTube's queue manager — move
   and all eight resize directions, the state machine, off-screen clamping, and the v0.2 → v0.3
-  settings migration. Not yet given a pass on live YouTube.
+  settings migration — and then on live YouTube on **2026-09-06**, signed in. The live pass found
+  one thing the harness could not: a panel restored from storage was placed against whatever
+  viewport was current when it was saved, so it could open partly off the bottom or right edge with
+  its controls clipped. Fixed in **v0.3.1**; the details are in `docs/BRIEF.md`.
 - YouTube is mid-migration from `ytd-*-renderer` elements to `yt-lockup-view-model`. Rather than
   chase that with a selector list, thumbnails are found structurally (a link that resolves to a video
   ID *and* contains an image), which covers both generations and whatever comes next.

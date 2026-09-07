@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube Queue
 // @namespace    https://github.com/dataterminals/YouTubeQueue
-// @version      0.3.0
+// @version      0.3.1
 // @description  Queue any video from any view — hover button, Shift-click, or the Q key — plus a movable, resizable queue panel that works on every page: running totals, one-click remove, drag reorder, and restore-after-reload.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/YouTubeQueue
@@ -883,6 +883,9 @@
     wireResize(dockEl);
     wireDockDrag(dockEl);
     document.body.appendChild(dockEl);
+    // The stored geometry was saved against whatever viewport was current last time. Reconcile it
+    // with this one now, while the panel is brand new, rather than waiting for a resize.
+    safe(reclampPlacement);
     return dockEl;
   }
 
@@ -999,6 +1002,7 @@
   const MIN_LIST_H = 90;     // px of list; the head and foot sit outside this
   const CHROME_H = 78;       // approximate head + foot height, used only to clamp the maximum
   const KEEP_ON_SCREEN = 90; // px of the panel that must stay reachable, wherever it was dropped
+  const EDGE_GAP = 16;       // px — the same margin the parked-in-a-corner CSS uses
 
   function pinPanel(dock) {
     if (prefs.dockX != null && prefs.dockY != null) return;
@@ -1042,9 +1046,36 @@
     toast('Panel put back in its corner');
   }
 
-  /** A shrinking window can strand a placed panel off-screen. Pull it back into reach. */
+  /**
+   * Seat a placed panel fully on screen when it fits.
+   *
+   * `clampToViewport` promises only that KEEP_ON_SCREEN px stay grabbable, which is the right rule
+   * for a panel the user just dropped somewhere odd — they chose that spot, and yanking it back
+   * would be rude. A panel coming back from storage chose nothing: it was placed against a viewport
+   * that may no longer exist, and restoring it with its footer under the bottom edge — Discard and
+   * the last rows unreachable — is never what was wanted. So when the panel fits, seat it; when it
+   * genuinely cannot, leave it to the reachability guarantee above.
+   */
+  function fitPlacement() {
+    if (prefs.dockX == null || prefs.dockY == null) return;
+    // The lower bound is EDGE_GAP, or maxX/maxY when the panel so nearly fills the viewport that
+    // even that margin won't fit — seat it flush rather than giving up and leaving it hanging.
+    const maxX = window.innerWidth - prefs.dockW - EDGE_GAP;
+    const maxY = window.innerHeight - (prefs.dockH + CHROME_H) - EDGE_GAP;
+    if (maxX >= 0) prefs.dockX = Math.max(Math.min(EDGE_GAP, maxX), Math.min(prefs.dockX, maxX));
+    if (maxY >= 0) prefs.dockY = Math.max(Math.min(EDGE_GAP, maxY), Math.min(prefs.dockY, maxY));
+  }
+
+  /**
+   * A shrinking window can strand a placed panel off-screen — and so can simply *loading* the page
+   * in a window smaller than the one the geometry was saved in, which fires no resize event at all.
+   * Called on resize and once when the panel is first built.
+   */
   function reclampPlacement() {
     if (!dockEl) return;
+    // Size first: fitPlacement positions against these, so they have to be current.
+    prefs.dockW = Math.max(MIN_W, Math.min(prefs.dockW, window.innerWidth - 24));
+    prefs.dockH = Math.max(MIN_LIST_H, Math.min(prefs.dockH, window.innerHeight - CHROME_H - 16));
     if (prefs.dockX != null) {
       const c = clampToViewport(prefs.dockX, prefs.dockY, prefs.dockW);
       prefs.dockX = c.x; prefs.dockY = c.y;
@@ -1053,8 +1084,7 @@
       const c = clampToViewport(prefs.pillX, prefs.pillY, 120);
       prefs.pillX = c.x; prefs.pillY = c.y;
     }
-    prefs.dockW = Math.max(MIN_W, Math.min(prefs.dockW, window.innerWidth - 24));
-    prefs.dockH = Math.max(MIN_LIST_H, Math.min(prefs.dockH, window.innerHeight - CHROME_H - 16));
+    fitPlacement();
     applyGeometry(dockEl);
     writePrefs(prefs);
   }
