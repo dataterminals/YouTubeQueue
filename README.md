@@ -35,6 +35,10 @@ sidebar, playlist pages:
   the title bar to put it back in its corner at the default size.
 - **Optional fade.** Turn on *Fade the panel while you watch* and it drops to 30% opacity until you
   point at it — visible enough to glance at, faint enough to sit over a video.
+- **Back to the full player.** The **`⤢`** button in the panel's title bar — or a click on the row
+  that's playing — opens whatever you're watching on its own watch page, *resuming where it was*
+  rather than restarting it. The same move as clicking YouTube's miniplayer, except the panel is
+  there on every page whether the miniplayer is up or not.
 - **Running totals.** How many are queued, the total runtime, and how much is left after the current
   video — in both the floating panel and YouTube's own sidebar panel.
 - **One-click remove** on every row, and **drag to reorder**.
@@ -71,6 +75,7 @@ script when a new `@version` is pushed.
 | Queue any video link | **Shift-click** it |
 | Minimize / restore the floating panel | **`Alt+Shift+Q`** |
 | Queue / play next from a thumbnail | Hover it, click the button that appears (top-left) |
+| Open what's playing in the full player | The **`⤢`** button, or click the row that's playing |
 | Move the panel | Drag its title bar (the pill drags too, and keeps its own spot) |
 | Resize the panel | Drag any edge or corner — the grip is at the bottom right |
 | Roll it up to the title bar | The **`▾`** button |
@@ -130,6 +135,14 @@ on the current page. That's the fastest way to tell "YouTube changed something" 
 - All four paths — add, read, reorder, remove — plus restore were verified against live YouTube on
   **2026-08-30**, signed out *and* signed in. If something misbehaves, run Diagnostics and
   [open an issue](https://github.com/dataterminals/YouTubeQueue/issues) with the output.
+- The v0.4.0 *open in the full player* button touches none of them either, and has two paths of its
+  own. The one that always runs — a watch navigation carrying `startTimeSeconds`, so the video
+  resumes instead of restarting — was verified against the local harness on **2026-09-08**, along
+  with the "you're already on this page" and "a different row was clicked" branches. The other, the
+  miniplayer's own expand control, is **inferred**: YouTube has rewritten the miniplayer and its
+  internals only mount once something is playing, which a signed-out probe session never reaches —
+  it gets bot-gated first. So it is written as an optimization that either hits or returns nothing,
+  with the verified path catching everything else. Diagnostics reports which one is live.
 - The v0.3.0 window changes (move, resize, roll up, minimize) touch none of those four paths. They
   were verified on **2026-09-04** against a local harness that stubs YouTube's queue manager — move
   and all eight resize directions, the state machine, off-screen clamping, and the v0.2 → v0.3

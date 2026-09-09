@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         YouTube Queue
 // @namespace    https://github.com/dataterminals/YouTubeQueue
-// @version      0.3.1
-// @description  Queue any video from any view — hover button, Shift-click, or the Q key — plus a movable, resizable queue panel that works on every page: running totals, one-click remove, drag reorder, and restore-after-reload.
+// @version      0.4.0
+// @description  Queue any video from any view — hover button, Shift-click, or the Q key — plus a movable, resizable queue panel that works on every page: running totals, one-click remove, drag reorder, jump back to the full player, and restore-after-reload.
 // @author       dataterminals
 // @homepageURL  https://github.com/dataterminals/YouTubeQueue
 // @supportURL   https://github.com/dataterminals/YouTubeQueue/issues
@@ -89,6 +89,21 @@
 //      where YouTube offers no endpoint at all. It restarts playback, so it stays behind a confirm.
 //      `Diagnostics` reports which path is live.
 //
+//   OPENING THE FULL PLAYER (one verified path, one inferred)
+//
+//   The panel outlives the watch page, so it needs a route back to it. `openCurrent` is the dock's
+//   version of clicking YouTube's miniplayer. Three branches, in order: already on that video's
+//   page (resolve nothing, just scroll the player back into view); the miniplayer is up (click its
+//   own expand control — seamless, it hands playback over with no navigation); otherwise navigate,
+//   carrying `startTimeSeconds` so the video RESUMES instead of restarting at zero. Anything less
+//   than that last detail makes the button a footgun.
+//
+//   The miniplayer branch is INFERRED, and the only such path in this file. YouTube has rewritten
+//   the miniplayer (`ytdMiniplayerComponentHost`) and its internals only mount once something is
+//   playing, which a signed-out probe session cannot reach — it gets bot-gated first. So it is
+//   written to either hit or return null, and the navigation branch catches every miss. The rest
+//   was verified against the local harness on 2026-09-08; see docs/BRIEF.md.
+//
 //   TWO THINGS LIVE TESTING TAUGHT US (do not regress these)
 //
 //   * TRUSTED TYPES.  youtube.com ships `require-trusted-types-for 'script'`, so ANY `innerHTML`
@@ -125,7 +140,7 @@
 (function () {
   'use strict';
 
-  const VERSION = '0.3.0';
+  const VERSION = '0.4.0';
 
   // ===========================================================================
   // Preferences. GM storage when available, localStorage otherwise. UI only.
@@ -606,14 +621,97 @@
     return 'partial';
   }
 
-  function jumpTo(index) {
+  /**
+   * Play a queue row. `startSeconds` resumes part-way in, which is what "open the thing I am
+   * already watching" needs — without it, a watch navigation restarts the video from zero.
+   */
+  function jumpTo(index, startSeconds) {
     const it = YT.items()[index];
     if (!it) return false;
-    if (it.endpoint) return YT.resolve(it.endpoint);
+    const start = Number.isFinite(startSeconds) && startSeconds > 0 ? Math.floor(startSeconds) : 0;
+
+    if (it.endpoint) {
+      if (!start) return YT.resolve(it.endpoint);
+      // Clone before stamping a start time on it: this endpoint is YouTube's own renderer data and
+      // is reused every time the native panel row is clicked. Mutating it would leak our seek.
+      const ep = safe(() => JSON.parse(JSON.stringify(it.endpoint)), null);
+      if (ep && ep.watchEndpoint) {
+        ep.watchEndpoint.startTimeSeconds = start;
+        return YT.resolve(ep);
+      }
+      return YT.resolve(it.endpoint);
+    }
+
+    const url = '/watch?v=' + it.videoId + (start ? '&t=' + start : '');
+    const watchEndpoint = { videoId: it.videoId };
+    if (start) watchEndpoint.startTimeSeconds = start;
     return YT.resolve({
-      commandMetadata: { webCommandMetadata: { url: '/watch?v=' + it.videoId, webPageType: 'WEB_PAGE_TYPE_WATCH' } },
-      watchEndpoint: { videoId: it.videoId },
+      commandMetadata: { webCommandMetadata: { url, webPageType: 'WEB_PAGE_TYPE_WATCH' } },
+      watchEndpoint,
     });
+  }
+
+  /**
+   * The miniplayer's own "expand to the watch page" control, or null when the miniplayer isn't up.
+   *
+   * INFERRED, not verified — unlike the four primitives. `ytd-miniplayer` is always in the DOM
+   * (verified 2026-09-08: present with a zero-size box on a page with no miniplayer), and YouTube
+   * has been rewriting it — the current build renders it as `ytdMiniplayerComponentHost`, whose
+   * internals we could not observe, because playback is what mounts them and a signed-out probe
+   * session gets bot-gated before anything plays. So: match a few plausible controls, insist the
+   * miniplayer is actually on screen first, and let `openCurrent` fall through to a plain watch
+   * navigation whenever this comes back empty. The fallback always works; this path only makes it
+   * seamless (no re-navigation) when it hits.
+   */
+  function miniplayerExpand() {
+    const mini = document.querySelector('ytd-miniplayer');
+    if (!mini) return null;
+    const box = safe(() => mini.getBoundingClientRect(), null);
+    if (!box || box.width < 40 || box.height < 40) return null; // in the DOM, but closed
+    const btn = mini.querySelector([
+      '.ytp-miniplayer-expand-watch-page-button',
+      'button[aria-label="Expand"]',
+      '#expand-button button',
+      'button#expand-button',
+    ].join(','));
+    return btn && safe(() => btn.getBoundingClientRect().width > 0, false) ? btn : null;
+  }
+
+  /** Where the player currently is in `videoId`, or 0 when it is playing something else. */
+  function playbackPositionFor(videoId) {
+    const p = YT.player();
+    if (!p || typeof p.getCurrentTime !== 'function') return 0;
+    const playing = safe(() => p.getVideoData?.().video_id, null);
+    if (playing && playing !== videoId) return 0;
+    const t = safe(() => Math.floor(p.getCurrentTime()), 0);
+    return Number.isFinite(t) && t > 3 ? t : 0;
+  }
+
+  /**
+   * Open whatever is playing in the full watch page — the panel's answer to clicking YouTube's
+   * miniplayer thumbnail. Returns a status string so the caller can explain itself.
+   */
+  function openCurrent() {
+    const items = YT.items();
+    if (!items.length) return 'empty';
+    const index = Math.min(Math.max(YT.currentIndex(), 0), items.length - 1);
+    const it = items[index];
+
+    // Already on this video's page: "full view" is what we are looking at, so the only useful thing
+    // left is to put the player back on screen for someone who has scrolled down into the comments.
+    const here = location.pathname === '/watch'
+      ? safe(() => new URLSearchParams(location.search).get('v'), null) : null;
+    if (here && here === it.videoId) {
+      if (window.scrollY > 4) { safe(() => window.scrollTo({ top: 0, behavior: 'smooth' })); return 'scrolled'; }
+      return 'already';
+    }
+
+    const expand = miniplayerExpand();
+    if (expand) { safe(() => expand.click()); return 'expanded'; }
+
+    // Nothing to expand: navigate there ourselves, carrying the playback position so the video
+    // resumes where it was rather than starting over.
+    return jumpTo(index, playbackPositionFor(it.videoId)) ? 'opened' : 'error';
   }
 
   // ===========================================================================
@@ -856,6 +954,7 @@
     head.appendChild(el('span', 'ytq-h-title', 'Queue'));
     head.appendChild(el('span', 'ytq-h-count'));
     head.appendChild(el('span', 'ytq-h-spacer'));
+    head.appendChild(headButton('open', '⤢', 'Open what’s playing in the full player'));
     head.appendChild(headButton('clear', 'Clear', 'Clear the queue'));
     head.appendChild(headButton('shade', '▾', 'Roll up to the title bar'));
     head.appendChild(headButton('pill', '–', 'Minimize to a pill'));
@@ -914,6 +1013,13 @@
     const index = row ? Number(row.dataset.index) : -1;
 
     if (action === 'shade') { setDockState(prefs.dockState === 'shaded' ? 'open' : 'shaded'); return; }
+    if (action === 'open') {
+      const status = openCurrent();
+      if (status === 'already') toast('You’re already watching this one');
+      else if (status === 'empty') toast('Nothing playing to open');
+      else if (status === 'error') toast('Couldn’t open the player from here');
+      return;
+    }
     if (action === 'pill') { setDockState('pill'); return; }
     if (action === 'clear') {
       if (window.confirm('Clear the whole queue?')) {
@@ -1250,12 +1356,14 @@
     const list = dock.querySelector('.ytq-list');
     const foot = dock.querySelector('.ytq-foot');
     const clearBtn = dock.querySelector('[data-ytq-dock="clear"]');
+    const openBtn = dock.querySelector('.ytq-head [data-ytq-dock="open"]');
     list.textContent = '';
 
     if (!items.length) {
       dock.querySelector('.ytq-pill').textContent = `▸ Restore ${snap.ids.length}`;
       dock.querySelector('.ytq-h-count').textContent = '';
       clearBtn.style.display = 'none';
+      openBtn.style.display = 'none';
       foot.textContent = '';
 
       const li = el('li', 'ytq-empty');
@@ -1274,6 +1382,7 @@
 
     const t = totals(items, current);
     clearBtn.style.display = '';
+    openBtn.style.display = '';
     dock.querySelector('.ytq-pill').textContent = `▸ Queue ${items.length}`;
     dock.querySelector('.ytq-h-count').textContent =
       `${items.length} · ${clock(t.total)}${t.unknown ? ` +${t.unknown} live` : ''}`;
@@ -1282,12 +1391,13 @@
       // Nothing before the current row is dimmed. A queue is not necessarily played front to
       // back, so "earlier in the list" does not mean "already watched" — only the row that is
       // actually playing gets marked.
-      const li = el('li', 'ytq-row' + (i === current ? ' ytq-now' : ''));
+      const now = i === current;
+      const li = el('li', 'ytq-row' + (now ? ' ytq-now' : ''));
       li.dataset.index = String(i);
       li.draggable = true;
 
       li.appendChild(el('span', 'ytq-drag', '⠿')).title = 'Drag to reorder';
-      li.appendChild(el('span', 'ytq-num', i === current ? '▶' : String(i + 1)));
+      li.appendChild(el('span', 'ytq-num', now ? '▶' : String(i + 1)));
 
       if (it.thumb) {
         const img = el('img', 'ytq-thumb');
@@ -1304,10 +1414,12 @@
       }
 
       const meta = el('span', 'ytq-meta');
-      meta.dataset.ytqDock = 'play';
+      // The row that is playing goes through `openCurrent` instead of a plain jump: re-navigating
+      // to the video you are already watching would restart it from zero.
+      meta.dataset.ytqDock = now ? 'open' : 'play';
       meta.setAttribute('role', 'button');
       meta.tabIndex = 0;
-      meta.title = it.title;
+      meta.title = now ? it.title + ' — open in the full player' : it.title;
       meta.appendChild(el('span', 'ytq-t', it.title));
       meta.appendChild(el('span', 'ytq-b', it.author + (it.durationText ? ' · ' + it.durationText : '')));
       li.appendChild(meta);
@@ -1706,6 +1818,7 @@
         ? 'n/a — no row other than the current one'
         : (removeEndpointFor(probe) ? 'yes' : 'NO (signed out?)'),
       'clear: native button': !!(panel && panel.querySelector('button[aria-label="Clear queue"]')),
+      'open: miniplayer expand': miniplayerExpand() ? 'yes' : 'no — falls back to a watch navigation',
       'thumbnails decorated': document.querySelectorAll('.ytq-hover').length,
       'snapshot saved': safe(() => readSnapshot()?.ids.length, 0) || 0,
     };
@@ -1737,7 +1850,7 @@
 
     // Debug handle. Deliberately not part of the page's API surface.
     safe(() => Object.defineProperty(window, '__ytq', {
-      value: { YT, addToQueue, playNext, moveItem, removeAt, clearQueue, diagnostics,
+      value: { YT, addToQueue, playNext, moveItem, removeAt, clearQueue, openCurrent, diagnostics,
                resetPlacement, setDockState, prefs },
       configurable: true,
     }));

@@ -273,6 +273,7 @@ trade.
 | Move the panel anywhere; resize from 8 handles (v0.3.0) | Pointer events, not DnD — see below |
 | Three window states: open / rolled up / pill (v0.3.0) | `dockState`, migrated from v0.2's `dockOpen` |
 | Optional idle fade (v0.3.0) | Pure CSS `:hover`, off by default |
+| Open what's playing in the full player (v0.4.0) | `⤢` in the title bar, or the playing row — see below |
 | Snapshot + restore after reload | One command; verified in exact order |
 | Diagnostics | Reports which of the four primitives are live |
 
@@ -314,6 +315,38 @@ gone; only `.ytq-now` (the row that is actually playing) is marked.
 Note that the footer's *"N after this · X left"* readout carries the same sequential assumption. It
 was left alone on purpose — it is a statement about playing straight through from here, which is a
 real thing to want to know, and unlike the dimming it doesn't make the other rows look spent.
+
+### Getting back to the full player (v0.4.0)
+
+The panel's whole point is that it outlives the watch page — so it needed a route back to one. The
+gesture people already know is clicking YouTube's miniplayer thumbnail; `openCurrent` is the panel's
+version of it, on the `⤢` title-bar button and on the row that is playing.
+
+Three branches, and the ordering is the design:
+
+1. **Already on that video's watch page.** Resolve nothing. The full view is what you are looking
+   at, so the only useful act left is scrolling the player back on screen for someone who has wandered
+   into the comments — and if they were already at the top, say so instead of doing nothing silently.
+2. **The miniplayer is up.** Click its own expand control. That hands playback to the watch page with
+   no navigation at all, which is strictly better than anything we can synthesize.
+3. **Otherwise**, navigate — but stamp `startTimeSeconds` onto the row's `watchEndpoint` so the video
+   *resumes* rather than restarting at zero. Without it this is a footgun: "open what I'm watching"
+   that throws away where you were is worse than no button.
+
+Two things to not regress. **The endpoint is cloned before the seek is stamped on it** — it is
+YouTube's own renderer data, reused every time the native panel row is clicked, and mutating it would
+leak our seek into their UI. And **the position is only used when the player confirms it is playing
+that video** (`getVideoData().video_id`), so a stale player attached to something else cannot seek a
+different video to an unrelated timestamp.
+
+Branch 2 is the only **inferred** path in the script. `ytd-miniplayer` is always in the DOM (verified
+2026-09-08: present, zero-size, on a page with no miniplayer), but the current build renders it as
+`ytdMiniplayerComponentHost` and its internals only mount once something is playing — which a
+signed-out probe cannot reach, because YouTube bot-gates playback first. So `miniplayerExpand`
+requires the element to be genuinely on screen, matches a handful of plausible controls, and returns
+null otherwise; branch 3 catches every miss. Diagnostics reports which one is live, so the day
+YouTube renames it, the failure shows up as "falls back to a watch navigation" rather than as a dead
+button.
 
 ### Thumbnail discovery is structural, not a selector list
 
@@ -488,6 +521,28 @@ A note on session health: partway through testing, the signed-out session starte
 from the queue APIs and *every* add failed, including ones that had worked minutes earlier. That was
 YouTube throttling an anonymous session, not a script fault — a fresh load restored normal behaviour.
 Worth remembering before chasing a phantom bug.
+
+### v0.4.0 pass — 2026-09-08 (local harness, extended)
+
+The harness gained a `#movie_player` stub (`getCurrentTime` 42.7, `getVideoData` reporting the
+current row's id), real `navigationEndpoint`s on every row, and an optional fake miniplayer behind
+`?mini=1` — so both `openCurrent` branches can be driven, not just the one that happens to be live.
+
+| Check | Result |
+| --- | --- |
+| `⤢` resolves the CURRENT row's `watchEndpoint` | ✅ `vid00000003`, `startTimeSeconds: 42` |
+| Clicking the playing row does the same | ✅ identical command |
+| Clicking any other row still jumps plainly | ✅ `vid00000000`, no `startTimeSeconds` |
+| The source endpoint is not mutated by the seek stamp | ✅ no `startTimeSeconds` on the renderer data |
+| `?mini=1` — expand control clicked, nothing navigated | ✅ 1 click, `resolveCommand` never called |
+| Already on the video's page, scrolled down → scroll, don't navigate | ✅ scrollY 600 → 0, no command |
+| Already there and at the top | ✅ toast, no command, no expand |
+| `⤢` hidden in the restore-a-snapshot empty state | ✅ alongside Clear |
+
+Not covered, and honestly so: the real miniplayer's expand control (see above). A signed-out probe
+of live YouTube on the same date confirmed only that `ytd-miniplayer` exists with a zero-size box
+before anything plays; "Sign in to confirm you're not a bot" stopped playback, and with it any
+chance of seeing the mounted internals.
 
 ---
 
